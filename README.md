@@ -18,3 +18,13 @@ curl -fsSL -4 --tlsv1.2 --http1.1 \
 ```
 hgled -r
 ```
+
+# Opsional 
+Timpa di Local Startup sebelum " exit 0 "
+```
+sleep 2
+/usr/sbin/hgledon -power off
+/usr/sbin/hgledon -lan off
+sleep 20
+/usr/sbin/hgled -r
+```
