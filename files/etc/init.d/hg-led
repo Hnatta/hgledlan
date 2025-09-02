@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+# Simple LED init: jalankan urutan yang sebelumnya di rc.local
+#   sleep 2; hgledon -power off; hgledon -lan off; sleep 20; hgled -r
+
+START=95
+USE_PROCD=1
+NAME=hg-led
+
+# Ubah delay jika perlu lewat env file opsional:
+#   /etc/default/hg-led  berisi: DELAY1=2 DELAY2=20
+[ -f /etc/default/hg-led ] && . /etc/default/hg-led
+DELAY1="${DELAY1:-2}"
+DELAY2="${DELAY2:-20}"
+
+start_service() {
+  procd_open_instance
+  procd_set_param command /bin/sh -c "
+    sleep $DELAY1;
+    /usr/sbin/hgledon -power off || true;
+    /usr/sbin/hgledon -lan off   || true;
+    sleep $DELAY2;
+    /usr/sbin/hgled -r           || true
+  "
+  procd_set_param respawn 0 0 0
+  procd_close_instance
+}
+
+stop_service() { :; }
