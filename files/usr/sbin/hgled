@@ -2,14 +2,21 @@
 # hgled - Internet Indicator (HG680P LEDs)
 # off = merah, on = hijau, dis = mati (padam)
 # Start: kedua LED dis (mati)
-# ONLINE (HTTP OK): power on -> dis -> lan on -> dis (loop)
-# OFFLINE (HTTP FAIL): power off -> dis -> lan off -> dis (loop)
+# ONLINE  (HTTP OK):    power on -> dis -> lan on -> dis  (loop)
+# OFFLINE (HTTP FAIL):  power off -> dis -> lan off -> dis (loop)
+#
+# Per-step delay:
+#   online:  step0=2s, step1=0.5s, step2=2s, step3=0.5s
+#   offline: step0=1s, step1=0s,   step2=1s, step3=0.5s
+#
+# Cek URL jalan di background agar pola LED tidak tersendat.
 
 SERVICE_NAME="Internet Indicator"
 CHECK_URL="${CHECK_URL:-http://www.gstatic.com/generate_204}"
-INTERVAL="${INTERVAL:-0.1}"         # detik jeda antar langkah
-HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}" # detik timeout total HTTP
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"       # detik timeout total HTTP
+FALLBACK_INTERVAL="${FALLBACK_INTERVAL:-0.1}"  # jeda saat mode unknown
 PIDFILE="/var/run/internet-indicator.pid"
+STATEFILE="/var/run/internet-indicator.state"  # menyimpan 'online'/'offline'
 
 is_root() {
   [ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
@@ -18,6 +25,8 @@ is_root() {
 cleanup() {
   hgledon -lan dis 2>/dev/null
   hgledon -power dis 2>/dev/null
+  [ -n "${HEALTH_PID:-}" ] && kill "${HEALTH_PID}" 2>/dev/null
+  rm -f "$STATEFILE" 2>/dev/null
 }
 
 # Cek online via HTTP HEAD ke CHECK_URL
@@ -27,52 +36,106 @@ check_online() {
          --connect-timeout 3 --max-time "$HTTP_TIMEOUT" \
          -o /dev/null "$CHECK_URL"
   else
-    # fallback wget (busybox): 0 jika status 2xx/3xx (204 termasuk sukses)
+    # fallback wget (busybox): exit 0 jika status 2xx/3xx (204 termasuk sukses)
     wget -q --spider "$CHECK_URL"
   fi
 }
 
+# Jalankan cek health di background dan tulis hasil ke STATEFILE
+start_health_check_bg() {
+  # kalau masih ada cek yang berjalan, jangan duplikasi
+  if [ -n "${HEALTH_PID:-}" ] && kill -0 "${HEALTH_PID}" 2>/dev/null; then
+    return
+  fi
+  (
+    if check_online; then
+      printf "online" > "$STATEFILE"
+    else
+      printf "offline" > "$STATEFILE"
+    fi
+  ) &
+  HEALTH_PID=$!
+}
+
+# Ambil delay per step sesuai mode:step
+step_delay() {
+  case "${1}:${2}" in
+    online:0)  printf "2"   ;;
+    online:1)  printf "0.5" ;;
+    online:2)  printf "2"   ;;
+    online:3)  printf "0.5" ;;
+    offline:0) printf "1"   ;;
+    offline:1) printf "0"   ;;
+    offline:2) printf "1"   ;;
+    offline:3) printf "0.5" ;;
+    *)         printf "%s" "$FALLBACK_INTERVAL" ;;
+  esac
+}
+
+# Eksekusi satu langkah LED sesuai mode & step
+do_step() {
+  mode="$1"; step="$2"
+  case "${mode}:${step}" in
+    online:0)  hgledon -power on  ;; # hijau (power)
+    online:1)  hgledon -power dis ;; # mati
+    online:2)  hgledon -lan   on  ;; # hijau (lan)
+    online:3)  hgledon -lan   dis ;; # mati
+
+    offline:0) hgledon -power off ;; # merah (power)
+    offline:1) hgledon -power dis ;; # mati
+    offline:2) hgledon -lan   off ;; # merah (lan)
+    offline:3) hgledon -lan   dis ;; # jeda
+    *) : ;;
+  esac
+}
+
 loop() {
   trap 'cleanup; exit 0' INT TERM
-  # mati semua di awal
+
+  # Matikan semua LED di awal
   hgledon -lan dis
   hgledon -power dis
 
   mode="unknown"
   step=0
+  HEALTH_PID=""
+  : > "$STATEFILE" 2>/dev/null || true
+
+  # mulai cek pertama di background
+  start_health_check_bg
+
   while :; do
-    if check_online; then
-      # ONLINE
-      if [ "$mode" != "online" ]; then
-        mode="online"
-        step=0
-        hgledon -lan dis
-        hgledon -power dis
+    # Baca status terbaru jika ada
+    if [ -s "$STATEFILE" ]; then
+      desired="$(cat "$STATEFILE" 2>/dev/null)"
+      if [ "$desired" = "online" ] || [ "$desired" = "offline" ]; then
+        if [ "$mode" != "$desired" ]; then
+          mode="$desired"
+          step=0
+          # reset kedua LED tiap ganti mode
+          hgledon -lan dis
+          hgledon -power dis
+        fi
       fi
-      case "$step" in
-        0) hgledon -power on  ;; # hijau
-        1) hgledon -power dis ;; # mati
-        2) hgledon -lan   on  ;; # hijau
-        3) hgledon -lan   dis ;; # mati
-      esac
-      step=$(( (step + 1) % 4 ))
-    else
-      # OFFLINE
-      if [ "$mode" != "offline" ]; then
-        mode="offline"
-        step=0
-        hgledon -lan dis
-        hgledon -power dis
-      fi
-      case "$step" in
-        0) hgledon -power off ;; # merah
-        1) hgledon -power dis ;; # mati
-        2) hgledon -lan   off ;; # merah
-        3) hgledon -lan   dis ;; # mati
-      esac
-      step=$(( (step + 1) % 4 ))
     fi
-    sleep "$INTERVAL"
+
+    # Jalankan satu langkah pola (kalau mode sudah diketahui)
+    if [ "$mode" = "online" ] || [ "$mode" = "offline" ]; then
+      do_step "$mode" "$step"
+      delay="$(step_delay "$mode" "$step")"
+      # langkah berikutnya
+      step=$(( (step + 1) % 4 ))
+      # sleep jika delay > 0
+      [ "$delay" != "0" ] && sleep "$delay"
+    else
+      # belum ada status: jeda pendek
+      sleep "$FALLBACK_INTERVAL"
+    fi
+
+    # Jika background health-check sudah selesai, langsung mulai yang baru
+    if [ -z "${HEALTH_PID:-}" ] || ! kill -0 "${HEALTH_PID}" 2>/dev/null; then
+      start_health_check_bg
+    fi
   done
 }
 
@@ -103,8 +166,8 @@ stop() {
     rm -f "$PIDFILE"
   fi
 
-  # fallback: kalau masih ada proses -l tanpa pidfile
-  pids="$(ps w | grep -E "[/]usr/sbin/hgled[[:space:]]-l" | awk '{print $1}')"
+  # fallback: hentikan proses foreground loop jika ada
+  pids="$(ps w | grep -E "[/]bin/sh[[:space:]].*internet-indicator.*[[:space:]]-l" | awk '{print $1}')"
   if [ -n "$pids" ]; then
     echo "$pids" | xargs -r kill
     stopped="yes"
@@ -126,15 +189,16 @@ Usage: $0 -r | -s | -l
   -s  Stop service
   -l  Run loop in foreground (debug)
 Env:
-  CHECK_URL       default: $CHECK_URL
-  INTERVAL        default: $INTERVAL
-  HTTP_TIMEOUT    default: $HTTP_TIMEOUT
+  CHECK_URL          default: $CHECK_URL
+  HTTP_TIMEOUT       default: $HTTP_TIMEOUT
+  FALLBACK_INTERVAL  default: $FALLBACK_INTERVAL (saat mode unknown)
 EOF
 }
 
 case "${1:-}" in
   -l) loop ;;
-  -r) start ;;
+  -r) stop; start ;;
   -s) stop ;;
   *)  usage ;;
 esac
+
