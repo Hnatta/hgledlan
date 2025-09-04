@@ -1,86 +1,97 @@
 #!/bin/sh
-# install-hgledlan.sh — OpenWrt one-shot installer via ZIP
-# - Download ZIP
-# - Extract
-# - Run repo installer.sh
-# - Cleanup (ZIP + extracted dir)
+# installer.sh — OpenWrt installer untuk Hnatta/hgledlan
+# Langkah: download ZIP -> extract -> copy files/ -> chmod -> patch rc.local -> cleanup
 
-set -e
+set -eu
 
 ZIP_URL="https://github.com/Hnatta/hgledlan/archive/refs/heads/main.zip"
-WORKDIR="/tmp/hgledlan-$$"
+WORKDIR="$(mktemp -d /tmp/hgledlan.XXXXXX)"
 ZIP_FILE="$WORKDIR/main.zip"
 EXTRACT_DIR="$WORKDIR/extract"
 REPO_DIR="$EXTRACT_DIR/hgledlan-main"
+RC_LOCAL="/etc/rc.local"
 
 log() { printf "%s\n" "$*"; }
-die() { printf "ERROR: %s\n" "$*" >&2; exit 1; }
-
-need_root() { [ "$(id -u)" -eq 0 ] || die "jalankan sebagai root"; }
-
 have() { command -v "$1" >/dev/null 2>&1; }
+
+need_root() {
+  [ "$(id -u)" -eq 0 ] || { echo "Harus dijalankan sebagai root"; exit 1; }
+}
 
 fetch_zip() {
   log ">> Mengunduh ZIP..."
-  mkdir -p "$WORKDIR"
+  mkdir -p "$EXTRACT_DIR"
   if have curl; then
-    # dua percobaan: normal, lalu fallback (ipv4 + tlsv1.2 + http/1.1)
     curl -fsSL --connect-timeout 10 --retry 3 -o "$ZIP_FILE" "$ZIP_URL" \
-    || curl -fsSL -4 --tlsv1.2 --http1.1 -o "$ZIP_FILE" "$ZIP_URL" \
-    || die "gagal mengunduh ZIP (curl)"
+    || { opkg update >/dev/null 2>&1 || true; opkg install ca-bundle ca-certificates >/dev/null 2>&1 || true; curl -fsSL -o "$ZIP_FILE" "$ZIP_URL"; }
   elif have wget; then
     wget -q -O "$ZIP_FILE" "$ZIP_URL" \
-    || wget -q --no-check-certificate -O "$ZIP_FILE" "$ZIP_URL" \
-    || die "gagal mengunduh ZIP (wget)"
+    || { opkg update >/dev/null 2>&1 || true; opkg install ca-bundle ca-certificates >/dev/null 2>&1 || true; wget -q -O "$ZIP_FILE" "$ZIP_URL"; }
   else
-    die "butuh curl atau wget"
+    opkg update || true
+    opkg install wget-ssl || opkg install wget || true
+    wget -q -O "$ZIP_FILE" "$ZIP_URL"
   fi
 }
 
 ensure_unzip() {
   if have unzip; then
-    UNZIP="unzip -q"
-    return
-  fi
-  if have bsdtar; then
-    UNZIP="bsdtar -xf"
-    return
-  fi
-  if have opkg; then
-    log ">> Memasang 'unzip' via opkg..."
-    opkg update || true
-    opkg install unzip || die "opkg gagal memasang unzip"
-    UNZIP="unzip -q"
+    UNZIP=unzip
+  elif have bsdtar; then
+    UNZIP=bsdtar
   else
-    die "tidak ada unzip/bsdtar dan tidak bisa memasang via opkg"
+    log ">> Memasang unzip via opkg..."
+    opkg update || true
+    opkg install unzip || { echo "Gagal memasang unzip"; exit 1; }
+    UNZIP=unzip
   fi
 }
 
 extract_zip() {
   log ">> Mengekstrak ZIP..."
-  mkdir -p "$EXTRACT_DIR"
-  # pilih perintah ekstrak sesuai ketersediaan
-  if echo "$UNZIP" | grep -q bsdtar; then
+  if [ "$UNZIP" = "bsdtar" ]; then
     bsdtar -xf "$ZIP_FILE" -C "$EXTRACT_DIR"
   else
     unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
   fi
-  [ -d "$REPO_DIR" ] || die "folder repo tidak ditemukan di dalam ZIP"
+  [ -d "$REPO_DIR/files" ] || { echo "folder files/ tidak ditemukan di dalam ZIP"; exit 1; }
 }
 
-run_installer() {
-  log ">> Menjalankan installer bawaan repo..."
-  cd "$REPO_DIR" || die "gagal cd ke $REPO_DIR"
-  [ -f installer.sh ] || die "installer.sh tidak ada di repo ZIP"
-  # pastikan bisa dieksekusi
-  chmod +x installer.sh || true
-  sh ./installer.sh
+install_files() {
+  log ">> Menyalin berkas ke root (/)..."
+  # copy isi folder files/ (titik di akhir penting untuk copy hidden files)
+  cp -a "$REPO_DIR/files/." / 2>/dev/null || cp -R "$REPO_DIR/files/"* /
+  # normalisasi EOL + izin eksekusi
+  for f in /usr/sbin/hgled /usr/sbin/hgledon; do
+    [ -f "$f" ] && { sed -i 's/\r$//' "$f" 2>/dev/null || true; chmod +x "$f" 2>/dev/null || true; }
+  done
+}
+
+patch_rc_local() {
+  log ">> Menambahkan startup di rc.local..."
+  if [ ! -f "$RC_LOCAL" ]; then
+    printf '#!/bin/sh\n' > "$RC_LOCAL"
+    chmod +x "$RC_LOCAL"
+  fi
+  # hapus block lama (jika ada) dan baris exit 0 agar tidak dobel
+  sed -i '/^# >>> hgledlan start$/, /^# <<< hgledlan end$/d' "$RC_LOCAL"
+  sed -i '/^[[:space:]]*exit 0[[:space:]]*$/d' "$RC_LOCAL"
+  # tambahkan block baru + exit 0
+  cat >> "$RC_LOCAL" <<'EOF'
+# >>> hgledlan start
+sleep 2
+/usr/sbin/hgledon -power off || true
+/usr/sbin/hgledon -lan off   || true
+sleep 20
+/usr/sbin/hgled -r           || true
+# <<< hgledlan end
+EOF
+  echo "exit 0" >> "$RC_LOCAL"
 }
 
 cleanup() {
-  log ">> Cleanup..."
+  log ">> Bersih-bersih file unduhan..."
   rm -rf "$WORKDIR"
-  log ">> Selesai."
 }
 
 main() {
@@ -88,8 +99,10 @@ main() {
   fetch_zip
   ensure_unzip
   extract_zip
-  run_installer
+  install_files
+  patch_rc_local
   cleanup
+  log ">> Instalasi hgledlan selesai. Kamu bisa reboot, atau jalankan: /usr/sbin/hgled -r"
 }
 
 main "$@"
