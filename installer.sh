@@ -1,6 +1,7 @@
 #!/bin/sh
 # installer.sh — OpenWrt installer untuk Hnatta/hgledlan
 # Langkah: download ZIP -> extract -> copy files/ -> chmod -> patch rc.local -> cleanup
+# Kompatibel BusyBox (OpenWrt); tanpa rekursi/loop.
 
 set -eu
 
@@ -36,24 +37,16 @@ fetch_zip() {
 
 ensure_unzip() {
   if have unzip; then
-    UNZIP=unzip
-  elif have bsdtar; then
-    UNZIP=bsdtar
-  else
-    log ">> Memasang unzip via opkg..."
-    opkg update || true
-    opkg install unzip || { echo "Gagal memasang unzip"; exit 1; }
-    UNZIP=unzip
+    return
   fi
+  log ">> Memasang unzip via opkg..."
+  opkg update || true
+  opkg install unzip || { echo "Gagal memasang unzip"; exit 1; }
 }
 
 extract_zip() {
   log ">> Mengekstrak ZIP..."
-  if [ "$UNZIP" = "bsdtar" ]; then
-    bsdtar -xf "$ZIP_FILE" -C "$EXTRACT_DIR"
-  else
-    unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
-  fi
+  unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
   [ -d "$REPO_DIR/files" ] || { echo "folder files/ tidak ditemukan di dalam ZIP"; exit 1; }
 }
 
@@ -69,15 +62,20 @@ install_files() {
 
 patch_rc_local() {
   log ">> Menambahkan startup di rc.local..."
+  # pastikan rc.local ada dan executable
   if [ ! -f "$RC_LOCAL" ]; then
     printf '#!/bin/sh\n' > "$RC_LOCAL"
     chmod +x "$RC_LOCAL"
   fi
-  # hapus block lama (jika ada) dan baris exit 0 agar tidak dobel
-  sed -i '/^# >>> hgledlan start$/, /^# <<< hgledlan end$/d' "$RC_LOCAL"
-  sed -i '/^[[:space:]]*exit 0[[:space:]]*$/d' "$RC_LOCAL"
-  # tambahkan block baru + exit 0
-  cat >> "$RC_LOCAL" <<'EOF'
+
+  # Hapus blok lama dan baris 'exit 0' lama (kompatibel BusyBox awk)
+  awk 'BEGIN{skip=0}
+       /^# >>> hgledlan start$/ {skip=1; next}
+       /^# <<< hgledlan end$/   {skip=0; next}
+       { if (!skip && $0 !~ /^[[:space:]]*exit 0[[:space:]]*$/) print }' "$RC_LOCAL" > "$RC_LOCAL.tmp"
+
+  # Tambahkan blok baru + exit 0
+  cat >> "$RC_LOCAL.tmp" <<'EOF'
 # >>> hgledlan start
 sleep 2
 /usr/sbin/hgledon -power off || true
@@ -85,8 +83,10 @@ sleep 2
 sleep 20
 /usr/sbin/hgled -r           || true
 # <<< hgledlan end
+exit 0
 EOF
-  echo "exit 0" >> "$RC_LOCAL"
+
+  mv "$RC_LOCAL.tmp" "$RC_LOCAL"
 }
 
 cleanup() {
@@ -102,7 +102,7 @@ main() {
   install_files
   patch_rc_local
   cleanup
-  log ">> Instalasi hgledlan selesai. Kamu bisa reboot, atau jalankan: /usr/sbin/hgled -r"
+  log ">> Instalasi hgledlan selesai. Kamu bisa reboot, atau jalankan sekarang: /usr/sbin/hgled -r"
 }
 
 main "$@"
