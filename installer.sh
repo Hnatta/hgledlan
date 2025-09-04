@@ -1,81 +1,42 @@
 #!/bin/sh
-# installer.sh — OpenWrt installer untuk Hnatta/hgledlan
-# Langkah: download ZIP -> extract -> copy files/ -> chmod -> patch rc.local -> cleanup
-# Kompatibel BusyBox (OpenWrt); tanpa rekursi/loop.
-
+# Pasang hgledon/hgled dan tambahkan ke /etc/rc.local (tanpa init.d)
+# Pakai: curl -fsSL https://raw.githubusercontent.com/Hnatta/hgledlan/main/installer.sh | sh
 set -eu
 
-ZIP_URL="https://github.com/Hnatta/hgledlan/archive/refs/heads/main.zip"
-WORKDIR="$(mktemp -d /tmp/hgledlan.XXXXXX)"
-ZIP_FILE="$WORKDIR/main.zip"
-EXTRACT_DIR="$WORKDIR/extract"
-REPO_DIR="$EXTRACT_DIR/hgledlan-main"
-RC_LOCAL="/etc/rc.local"
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/Hnatta/hgledlan/main}"
 
-log() { printf "%s\n" "$*"; }
-have() { command -v "$1" >/dev/null 2>&1; }
+say(){ echo "[hgledlan] $*"; }
+[ "$(id -u)" = "0" ] || { say "Harus dijalankan sebagai root"; exit 1; }
 
-need_root() {
-  [ "$(id -u)" -eq 0 ] || { echo "Harus dijalankan sebagai root"; exit 1; }
+fetch_bin(){  # untuk B I N A R I (jangan di-sed)
+  src="$1"; dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  say "ambil(bin) $src -> $dst"
+  curl -fsSL "$REPO_BASE/$src" -o "$dst"
+  chmod +x "$dst"
 }
 
-fetch_zip() {
-  log ">> Mengunduh ZIP..."
-  mkdir -p "$EXTRACT_DIR"
-  if have curl; then
-    curl -fsSL --connect-timeout 10 --retry 3 -o "$ZIP_FILE" "$ZIP_URL" \
-    || { opkg update >/dev/null 2>&1 || true; opkg install ca-bundle ca-certificates >/dev/null 2>&1 || true; curl -fsSL -o "$ZIP_FILE" "$ZIP_URL"; }
-  elif have wget; then
-    wget -q -O "$ZIP_FILE" "$ZIP_URL" \
-    || { opkg update >/dev/null 2>&1 || true; opkg install ca-bundle ca-certificates >/dev/null 2>&1 || true; wget -q -O "$ZIP_FILE" "$ZIP_URL"; }
-  else
-    opkg update || true
-    opkg install wget-ssl || opkg install wget || true
-    wget -q -O "$ZIP_FILE" "$ZIP_URL"
-  fi
-}
+# --- salin binari ---
+fetch_bin files/usr/sbin/hgledon /usr/sbin/hgledon
+fetch_bin files/usr/sbin/hgled   /usr/sbin/hgled
 
-ensure_unzip() {
-  if have unzip; then
-    return
-  fi
-  log ">> Memasang unzip via opkg..."
-  opkg update || true
-  opkg install unzip || { echo "Gagal memasang unzip"; exit 1; }
-}
+# --- siapkan /etc/rc.local kalau belum ada ---
+if [ ! -f /etc/rc.local ]; then
+  say "buat /etc/rc.local baru"
+  cat > /etc/rc.local <<'NEWRC'
+#!/bin/sh
+# custom startup here
+exit 0
+NEWRC
+  chmod +x /etc/rc.local
+fi
 
-extract_zip() {
-  log ">> Mengekstrak ZIP..."
-  unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
-  [ -d "$REPO_DIR/files" ] || { echo "folder files/ tidak ditemukan di dalam ZIP"; exit 1; }
-}
+# --- hapus blok lama (jika ada), lalu sisipkan blok baru sebelum 'exit 0' ---
+BLOCK_START='# >>> hgledlan start'
+BLOCK_END='# <<< hgledlan end'
+sed -i "/^$BLOCK_START\$/,/^$BLOCK_END\$/d" /etc/rc.local
 
-install_files() {
-  log ">> Menyalin berkas ke root (/)..."
-  # copy isi folder files/ (titik di akhir penting untuk copy hidden files)
-  cp -a "$REPO_DIR/files/." / 2>/dev/null || cp -R "$REPO_DIR/files/"* /
-  # normalisasi EOL + izin eksekusi
-  for f in /usr/sbin/hgled /usr/sbin/hgledon; do
-    [ -f "$f" ] && { sed -i 's/\r$//' "$f" 2>/dev/null || true; chmod +x "$f" 2>/dev/null || true; }
-  done
-}
-
-patch_rc_local() {
-  log ">> Menambahkan startup di rc.local..."
-  # pastikan rc.local ada dan executable
-  if [ ! -f "$RC_LOCAL" ]; then
-    printf '#!/bin/sh\n' > "$RC_LOCAL"
-    chmod +x "$RC_LOCAL"
-  fi
-
-  # Hapus blok lama dan baris 'exit 0' lama (kompatibel BusyBox awk)
-  awk 'BEGIN{skip=0}
-       /^# >>> hgledlan start$/ {skip=1; next}
-       /^# <<< hgledlan end$/   {skip=0; next}
-       { if (!skip && $0 !~ /^[[:space:]]*exit 0[[:space:]]*$/) print }' "$RC_LOCAL" > "$RC_LOCAL.tmp"
-
-  # Tambahkan blok baru + exit 0
-  cat >> "$RC_LOCAL.tmp" <<'EOF'
+BLOCK_CONTENT=$(cat <<'BLK'
 # >>> hgledlan start
 sleep 2
 /usr/sbin/hgledon -power off || true
@@ -83,26 +44,30 @@ sleep 2
 sleep 20
 /usr/sbin/hgled -r           || true
 # <<< hgledlan end
-exit 0
-EOF
+BLK
+)
 
-  mv "$RC_LOCAL.tmp" "$RC_LOCAL"
-}
+if grep -qE '^exit 0$' /etc/rc.local; then
+  awk -v blk="$BLOCK_CONTENT" '
+    BEGIN{put=0}
+    /^exit 0$/ && !put {print blk; put=1}
+    {print}
+    END{if(!put){print blk; print "exit 0"}}
+  ' /etc/rc.local > /etc/rc.local.new && mv /etc/rc.local.new /etc/rc.local
+else
+  printf '%s\nexit 0\n' "$BLOCK_CONTENT" >> /etc/rc.local
+fi
+chmod +x /etc/rc.local
 
-cleanup() {
-  log ">> Bersih-bersih file unduhan..."
-  rm -rf "$WORKDIR"
-}
+# --- jalankan SEKALI sekarang ---
+if /usr/sbin/hgled -r >/dev/null 2>&1; then
+  say "Jalankan: /usr/sbin/hgled -r  ✅"
+else
+  say "Jalankan: /usr/sbin/hgled -r  ❌ (abaikan jika perangkat belum mendukung)"
+fi
 
-main() {
-  need_root
-  fetch_zip
-  ensure_unzip
-  extract_zip
-  install_files
-  patch_rc_local
-  cleanup
-  log ">> Instalasi hgledlan selesai. Kamu bisa reboot, atau jalankan sekarang: /usr/sbin/hgled -r"
-}
-
-main "$@"
+say "Selesai ✅
+- Binari: /usr/sbin/hgledon, /usr/sbin/hgled
+- Startup otomatis sudah ditambahkan ke /etc/rc.local
+- Tes manual: /usr/sbin/hgled -r
+- Edit startup: vi /etc/rc.local (blok ditandai hgledlan)"
