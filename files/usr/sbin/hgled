@@ -7,7 +7,7 @@
 
 SERVICE_NAME="Internet Indicator"
 CHECK_URL="${CHECK_URL:-http://www.gstatic.com/generate_204}"
-INTERVAL="${INTERVAL:-.2}"         # detik jeda antar langkah
+INTERVAL="${INTERVAL:-0.1}"         # detik jeda antar langkah
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}" # detik timeout total HTTP
 PIDFILE="/var/run/internet-indicator.pid"
 
