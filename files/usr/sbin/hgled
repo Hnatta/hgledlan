@@ -1,73 +1,140 @@
-#!/bin/bash
-# /usr/sbin/hgled mode lan
-# HG680P GPIO Wrapper
-# by Adi Putra
-
-if [ "$(id -u)" != "0" ]; then
-  echo "This script must be run as root" 1>&2
-  exit 1
-fi
+#!/bin/sh
+# hgled - Internet Indicator (HG680P LEDs)
+# off = merah, on = hijau, dis = mati (padam)
+# Start: kedua LED dis (mati)
+# ONLINE (HTTP OK): power on -> dis -> lan on -> dis (loop)
+# OFFLINE (HTTP FAIL): power off -> dis -> lan off -> dis (loop)
 
 SERVICE_NAME="Internet Indicator"
+CHECK_URL="${CHECK_URL:-http://www.gstatic.com/generate_204}"
+INTERVAL="${INTERVAL:-.2}"         # detik jeda antar langkah
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}" # detik timeout total HTTP
+PIDFILE="/var/run/internet-indicator.pid"
 
-function loop() {
-  while true; do
-    hgledon -lan dis
-    if curl -X "HEAD" --connect-timeout 3 -so /dev/null "http://www.gstatic.com/generate_204"; then
-      hgledon -lan on
+is_root() {
+  [ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
+}
+
+cleanup() {
+  hgledon -lan dis 2>/dev/null
+  hgledon -power dis 2>/dev/null
+}
+
+# Cek online via HTTP HEAD ke CHECK_URL
+check_online() {
+  if command -v curl >/dev/null 2>&1; then
+    curl --silent --show-error --head --fail \
+         --connect-timeout 3 --max-time "$HTTP_TIMEOUT" \
+         -o /dev/null "$CHECK_URL"
+  else
+    # fallback wget (busybox): 0 jika status 2xx/3xx (204 termasuk sukses)
+    wget -q --spider "$CHECK_URL"
+  fi
+}
+
+loop() {
+  trap 'cleanup; exit 0' INT TERM
+  # mati semua di awal
+  hgledon -lan dis
+  hgledon -power dis
+
+  mode="unknown"
+  step=0
+  while :; do
+    if check_online; then
+      # ONLINE
+      if [ "$mode" != "online" ]; then
+        mode="online"
+        step=0
+        hgledon -lan dis
+        hgledon -power dis
+      fi
+      case "$step" in
+        0) hgledon -power on  ;; # hijau
+        1) hgledon -power dis ;; # mati
+        2) hgledon -lan   on  ;; # hijau
+        3) hgledon -lan   dis ;; # mati
+      esac
+      step=$(( (step + 1) % 4 ))
     else
-      hgledon -lan off
+      # OFFLINE
+      if [ "$mode" != "offline" ]; then
+        mode="offline"
+        step=0
+        hgledon -lan dis
+        hgledon -power dis
+      fi
+      case "$step" in
+        0) hgledon -power off ;; # merah
+        1) hgledon -power dis ;; # mati
+        2) hgledon -lan   off ;; # merah
+        3) hgledon -lan   dis ;; # mati
+      esac
+      step=$(( (step + 1) % 4 ))
     fi
-    sleep 1
+    sleep "$INTERVAL"
   done
 }
 
-function loop2() {
-  while true; do
-    hgledon -power on
-    if curl -X "HEAD" --connect-timeout 3 -so /dev/null "http://www.gstatic.com/generate_204"; then
-      hgledon -power dis
-    else
-      hgledon -power off
+start() {
+  is_root
+  mkdir -p "$(dirname "$PIDFILE")"
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "$SERVICE_NAME already running (pid $(cat "$PIDFILE"))."
+    exit 0
+  fi
+  "$0" -l >/dev/null 2>&1 &
+  echo $! > "$PIDFILE"
+  echo "Started $SERVICE_NAME (pid $(cat "$PIDFILE"))."
+}
+
+stop() {
+  stopped=""
+  if [ -f "$PIDFILE" ]; then
+    pid="$(cat "$PIDFILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      for i in 1 2 3; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+      done
+      stopped="yes"
     fi
-    sleep 1
-  done
+    rm -f "$PIDFILE"
+  fi
+
+  # fallback: kalau masih ada proses -l tanpa pidfile
+  pids="$(ps w | grep -E "[/]usr/sbin/hgled[[:space:]]-l" | awk '{print $1}')"
+  if [ -n "$pids" ]; then
+    echo "$pids" | xargs -r kill
+    stopped="yes"
+  fi
+
+  cleanup
+
+  if [ -n "$stopped" ]; then
+    echo "Stopped $SERVICE_NAME."
+  else
+    echo "$SERVICE_NAME not running."
+  fi
 }
 
-
-function start() {
-  echo -e "Starting ${SERVICE_NAME} service ..."
-  screen -AmdS internet-indicator "${0}" -l ; sleep 2;
-  screen -AmdS internet-indicator "${0}" -ll
-}
-
-function stop() {
-  echo -e "Stopping ${SERVICE_NAME} service ..."
-  kill $(screen -list | grep internet-indicator | awk -F '[.]' {'print $1'})
-}
-
-function usage() {
+usage() {
   cat <<EOF
-Usage:
-  -r  Run ${SERVICE_NAME} service
-  -s  Stop ${SERVICE_NAME} service
+Usage: $0 -r | -s | -l
+  -r  Run/daemonize service
+  -s  Stop service
+  -l  Run loop in foreground (debug)
+Env:
+  CHECK_URL       default: $CHECK_URL
+  INTERVAL        default: $INTERVAL
+  HTTP_TIMEOUT    default: $HTTP_TIMEOUT
 EOF
 }
 
-case "${1}" in
-  -l)
-    loop
-    ;;
-  -ll)
-    loop2
-    ;;
-  -r)
-    start
-    ;;
-  -s)
-    stop
-    ;;
-  *)
-    usage
-    ;;
+case "${1:-}" in
+  -l) loop ;;
+  -r) start ;;
+  -s) stop ;;
+  *)  usage ;;
 esac
