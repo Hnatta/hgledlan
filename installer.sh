@@ -1,73 +1,95 @@
 #!/bin/sh
-# Pasang hgledon/hgled dan tambahkan ke /etc/rc.local (tanpa init.d)
-# Pakai: curl -fsSL https://raw.githubusercontent.com/Hnatta/hgledlan/main/installer.sh | sh
-set -eu
+# install-hgledlan.sh — OpenWrt one-shot installer via ZIP
+# - Download ZIP
+# - Extract
+# - Run repo installer.sh
+# - Cleanup (ZIP + extracted dir)
 
-REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/Hnatta/hgledlan/main}"
+set -e
 
-say(){ echo "[hgledlan] $*"; }
-[ "$(id -u)" = "0" ] || { say "Harus dijalankan sebagai root"; exit 1; }
+ZIP_URL="https://github.com/Hnatta/hgledlan/archive/refs/heads/main.zip"
+WORKDIR="/tmp/hgledlan-$$"
+ZIP_FILE="$WORKDIR/main.zip"
+EXTRACT_DIR="$WORKDIR/extract"
+REPO_DIR="$EXTRACT_DIR/hgledlan-main"
 
-fetch_bin(){  # untuk B I N A R I (jangan di-sed)
-  src="$1"; dst="$2"
-  mkdir -p "$(dirname "$dst")"
-  say "ambil(bin) $src -> $dst"
-  curl -fsSL "$REPO_BASE/$src" -o "$dst"
-  chmod +x "$dst"
+log() { printf "%s\n" "$*"; }
+die() { printf "ERROR: %s\n" "$*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "jalankan sebagai root"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+fetch_zip() {
+  log ">> Mengunduh ZIP..."
+  mkdir -p "$WORKDIR"
+  if have curl; then
+    # dua percobaan: normal, lalu fallback (ipv4 + tlsv1.2 + http/1.1)
+    curl -fsSL --connect-timeout 10 --retry 3 -o "$ZIP_FILE" "$ZIP_URL" \
+    || curl -fsSL -4 --tlsv1.2 --http1.1 -o "$ZIP_FILE" "$ZIP_URL" \
+    || die "gagal mengunduh ZIP (curl)"
+  elif have wget; then
+    wget -q -O "$ZIP_FILE" "$ZIP_URL" \
+    || wget -q --no-check-certificate -O "$ZIP_FILE" "$ZIP_URL" \
+    || die "gagal mengunduh ZIP (wget)"
+  else
+    die "butuh curl atau wget"
+  fi
 }
 
-# --- salin binari ---
-fetch_bin files/usr/sbin/hgledon /usr/sbin/hgledon
-fetch_bin files/usr/sbin/hgled   /usr/sbin/hgled
+ensure_unzip() {
+  if have unzip; then
+    UNZIP="unzip -q"
+    return
+  fi
+  if have bsdtar; then
+    UNZIP="bsdtar -xf"
+    return
+  fi
+  if have opkg; then
+    log ">> Memasang 'unzip' via opkg..."
+    opkg update || true
+    opkg install unzip || die "opkg gagal memasang unzip"
+    UNZIP="unzip -q"
+  else
+    die "tidak ada unzip/bsdtar dan tidak bisa memasang via opkg"
+  fi
+}
 
-# --- siapkan /etc/rc.local kalau belum ada ---
-if [ ! -f /etc/rc.local ]; then
-  say "buat /etc/rc.local baru"
-  cat > /etc/rc.local <<'NEWRC'
-#!/bin/sh
-# custom startup here
-exit 0
-NEWRC
-  chmod +x /etc/rc.local
-fi
+extract_zip() {
+  log ">> Mengekstrak ZIP..."
+  mkdir -p "$EXTRACT_DIR"
+  # pilih perintah ekstrak sesuai ketersediaan
+  if echo "$UNZIP" | grep -q bsdtar; then
+    bsdtar -xf "$ZIP_FILE" -C "$EXTRACT_DIR"
+  else
+    unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+  fi
+  [ -d "$REPO_DIR" ] || die "folder repo tidak ditemukan di dalam ZIP"
+}
 
-# --- hapus blok lama (jika ada), lalu sisipkan blok baru sebelum 'exit 0' ---
-BLOCK_START='# >>> hgledlan start'
-BLOCK_END='# <<< hgledlan end'
-sed -i "/^$BLOCK_START\$/,/^$BLOCK_END\$/d" /etc/rc.local
+run_installer() {
+  log ">> Menjalankan installer bawaan repo..."
+  cd "$REPO_DIR" || die "gagal cd ke $REPO_DIR"
+  [ -f installer.sh ] || die "installer.sh tidak ada di repo ZIP"
+  # pastikan bisa dieksekusi
+  chmod +x installer.sh || true
+  sh ./installer.sh
+}
 
-BLOCK_CONTENT=$(cat <<'BLK'
-# >>> hgledlan start
-sleep 2
-/usr/sbin/hgledon -power off || true
-/usr/sbin/hgledon -lan off   || true
-sleep 20
-/usr/sbin/hgled -r           || true
-# <<< hgledlan end
-BLK
-)
+cleanup() {
+  log ">> Cleanup..."
+  rm -rf "$WORKDIR"
+  log ">> Selesai."
+}
 
-if grep -qE '^exit 0$' /etc/rc.local; then
-  awk -v blk="$BLOCK_CONTENT" '
-    BEGIN{put=0}
-    /^exit 0$/ && !put {print blk; put=1}
-    {print}
-    END{if(!put){print blk; print "exit 0"}}
-  ' /etc/rc.local > /etc/rc.local.new && mv /etc/rc.local.new /etc/rc.local
-else
-  printf '%s\nexit 0\n' "$BLOCK_CONTENT" >> /etc/rc.local
-fi
-chmod +x /etc/rc.local
+main() {
+  need_root
+  fetch_zip
+  ensure_unzip
+  extract_zip
+  run_installer
+  cleanup
+}
 
-# --- jalankan SEKALI sekarang ---
-if /usr/sbin/hgled -r >/dev/null 2>&1; then
-  say "Jalankan: /usr/sbin/hgled -r  ✅"
-else
-  say "Jalankan: /usr/sbin/hgled -r  ❌ (abaikan jika perangkat belum mendukung)"
-fi
-
-say "Selesai ✅
-- Binari: /usr/sbin/hgledon, /usr/sbin/hgled
-- Startup otomatis sudah ditambahkan ke /etc/rc.local
-- Tes manual: /usr/sbin/hgled -r
-- Edit startup: vi /etc/rc.local (blok ditandai hgledlan)"
+main "$@"
